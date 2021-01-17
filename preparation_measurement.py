@@ -1,15 +1,15 @@
 import numpy as np
-from qiskit import QuantumRegister, ClassicalRegister, QuantumCircuit, assemble, transpile
+from qiskit import QuantumRegister, ClassicalRegister, QuantumCircuit, transpile
+from qiskit.circuit import Parameter
 
-TOKEN_QI = 'YOUR_TOKEN'
-TOKEN_IBMQ = 'YOUR_TOKEN '
+from aqcm_circuits import universal_qcm, universal_qcm_SWAP, phase_covariant_qcm, economical_qcm
 
 
 def prepare_qubit(qc, qubit, theta, phi):
     """
     Prepares the state |psi>=cos(theta/2)|0>+e^(i phi)sin(theta/2)|1>
     """
-    qc.ry(theta, qubit)
+    ry = qc.ry(theta, qubit)
     qc.rz(phi, qubit)
 
 
@@ -42,39 +42,6 @@ def rotated_measurement_equator(qc, qubit, cbit, theta):
     qc.measure(qubit, cbit)
 
 
-def prepare_qubit_bb84(qc, qubit, index):
-    """
-    Prepare a bb84 state with the following convention
-    index=0 -> |0>
-    index=1 -> |1>
-    index=2 -> |+>
-    index=3 -> |->
-    """
-    if index == 1:
-        qc.x(qubit)
-    elif index == 2:
-        qc.sxdg(qubit)
-    elif index == 3:
-        qc.sx(qubit)
-
-
-def rotated_measurement_bb84(qc, qubit, cbit, index):
-    """
-    Performs a bb84 state measurement with the following convention
-    index=0 -> |0>
-    index=1 -> |1>
-    index=2 -> |+>
-    index=3 -> |->
-    """
-    if index == 1:
-        qc.x(qubit)
-    elif index == 2:
-        qc.sx(qubit)
-    elif index == 3:
-        qc.sxdg(qubit)
-    qc.measure(qubit, cbit)
-
-
 def sphere_points(num_pts):
     """
     Create num_pts evenly distributed points on a sphere as explained at
@@ -103,81 +70,165 @@ def equator_xz_points(num_pts):
 
     return np.array(coords)
 
-
-def equator_xy_points(num_pts):
+def prepare_circuits(qcm, input_states, num_points):
     """
-    Generate num_pts evenly spaced points on the xy equator. It returns their angular coordinates.
+    Prepare the circuits for a given qcm, set of input states and number of points (always 4 for the bb84 states)
+    It returns the coordinates of the points, the circuits not transpiled and the qubits of the copies.
+    qcm can be either 'uqcm', 'uqcm_swap', 'pcqcm', 'epcqcm'.
+    input_states can be either 'sphere', 'equator' or 'bb84'.
+    bb84 works just like equator, but the number of points is fixed at 4
     """
 
-    coords = []
-    for i in range(num_pts):
-        coords.append((np.pi / 2, 2 * np.pi / num_pts * i))
+    # Prepare the target points coordinates
+    if input_states == 'sphere':
+        target_points=sphere_points(num_points)
+    elif input_states == 'equator':
+        target_points=equator_xz_points(num_points)
+    elif input_states == 'bb84':
+        target_points=equator_xz_points(4)
+    else:
+        print("Error: input states set not recognized.")
+        exit()
 
-    return np.array(coords)
+    # Prepare the parameters for the circuits
+    theta_param, phi_param = Parameter('theta_param'), Parameter('phi_param')
+
+    # Define the number of qubits and create the circuits
+    if qcm=='uqcm' or qcm=='uqcm_swap' or qcm=='pcqcm':
+        nqubits = 3
+    elif qcm=='epcqcm':
+        nqubits = 2
+    else:
+        print("Error: quantum cloning machine not recognized.")
+        exit()
+    qreg = QuantumRegister(nqubits, 'q')
+    creg = ClassicalRegister(nqubits, 'c')
+    circuit = QuantumCircuit(qreg, creg)
+
+    # Add the preparation to the circuit
+    if input_states == 'sphere':
+        prepare_qubit(circuit, qreg[0], theta_param, phi_param)
+    elif input_states == 'equator' or input_states=='bb84':
+        prepare_qubit_equator(circuit, qreg[0], theta_param)
+    else:
+        print("Error: input states set not recognized.")
+        exit()
+
+    # Add the cloning machine circuit block
+    if qcm=='uqcm':
+        qubit_copy1, qubit_copy2 = universal_qcm(circuit, qreg[0], qreg[1], qreg[2])
+    elif qcm=='uqcm_swap':
+        qubit_copy1, qubit_copy2 = universal_qcm_SWAP(circuit, qreg[0], qreg[1], qreg[2])
+    elif qcm=='pcqcm':
+        qubit_copy1, qubit_copy2 = phase_covariant_qcm(circuit, qreg[0], qreg[1], qreg[2])
+    elif qcm=='epcqcm':
+        qubit_copy1, qubit_copy2 = economical_qcm(circuit, qreg[0], qreg[1])
+    else:
+        print("Error: quantum cloning machine not recognized.")
+        exit()
+    index_copy1 = qubit_copy1.index
+    index_copy2 = qubit_copy2.index
+
+    # Add the fidelity measurement
+    if input_states == 'sphere':
+        rotated_measurement(circuit, qreg[index_copy1], creg[index_copy1], theta_param, phi_param)
+        rotated_measurement(circuit, qreg[index_copy2], creg[index_copy2], theta_param, phi_param)
+        circuits = [circuit.bind_parameters({theta_param: points[0], phi_param: points[1]}) for points in target_points]
+    elif input_states == 'equator' or input_states == 'bb84':
+        rotated_measurement_equator(circuit, qreg[index_copy1], creg[index_copy1], theta_param)
+        rotated_measurement_equator(circuit, qreg[index_copy2], creg[index_copy2], theta_param)
+        circuits = [circuit.bind_parameters({theta_param: points[0]}) for points in target_points]
+    else:
+        print("Error: input states set not recognized.")
+        exit()
+
+    # Return the coordinates of the points, the circuits and the qubits of the copies
+    return target_points, circuits, qubit_copy1, qubit_copy2
 
 
-def bb84_points():
+def prepare_circuits_and_transpile(qcm, input_states, num_points, backend, optimization_level=1, transpiler_seed=None, initial_layout=None):
     """
-    Generate the coordinates of the bb84 states
+    Transpiling a circuit before binding the parameters might be faster.
+    Prepare the circuits for a given qcm, set of input states and number of points (always 4 for the bb84 states)
+    It returns the coordinates of the points, the circuits transpiled and the indices of the transpiled copies.
+    qcm can be either 'uqcm', 'uqcm_swap', 'pcqcm', 'epcqcm'.
+    input_states can be either 'sphere', 'equator' or 'bb84'.
+    bb84 works just like equator, but the number of points is fixed at 4
     """
-    coords = [(0, 0), (np.pi / 2, 0), (np.pi, 0), (3 * np.pi / 2, 0)]
 
-    return np.array(coords)
+    # Prepare the target points coordinates
+    if input_states == 'sphere':
+        target_points=sphere_points(num_points)
+    elif input_states == 'equator':
+        target_points=equator_xz_points(num_points)
+    elif input_states == 'bb84':
+        target_points=equator_xz_points(4)
+    else:
+        print("Error: input states set not recognized.")
+        exit()
 
+    # Prepare the parameters for the circuits
+    theta_param, phi_param = Parameter('theta_param'), Parameter('phi_param')
 
-def calculate_probabilities(job, index_copy1, index_copy2, nshots):
-    """
-    Calculate the marginal probabilities of getting 0 on each of the two copies qubits
-    """
-    # Format of the results:
-    # {'000': number_of_000, '010': number_of_010, '100': number_of_100, '110': number_of_110}
-    marg_prob0_copy1 = 0
-    marg_prob0_copy2 = 0
-    for outcome in job:
-        # If the outcome of the index_copy1 qubit was zero, then add the probability
-        if outcome[-1 - index_copy1] == '0':
-            marg_prob0_copy1 += job[outcome] / nshots
-        # If the outcome of the index_copy2 qubit was zero, then add the probability
-        if outcome[-1 - index_copy2] == '0':
-            marg_prob0_copy2 += job[outcome] / nshots
-    return marg_prob0_copy1, marg_prob0_copy2
+    # Define the number of qubits and create the circuits
+    if qcm=='uqcm' or qcm=='uqcm_swap' or qcm=='pcqcm':
+        nqubits = 3
+    elif qcm=='epcqcm':
+        nqubits = 2
+    else:
+        print("Error: quantum cloning machine not recognized.")
+        exit()
+    qreg = QuantumRegister(nqubits, 'q')
+    creg = ClassicalRegister(nqubits, 'c')
+    circuit = QuantumCircuit(qreg, creg)
 
+    # Add the preparation to the circuit
+    if input_states == 'sphere':
+        prepare_qubit(circuit, qreg[0], theta_param, phi_param)
+    elif input_states == 'equator' or input_states=='bb84':
+        prepare_qubit_equator(circuit, qreg[0], theta_param)
+    else:
+        print("Error: input states set not recognized.")
+        exit()
 
-def get_counts_from_jobs(jobs):
-    """
-    Extract the counts from the input jobs
-    """
-    counts_array = []
-    for job in jobs:
-        # get_counts() returns a list of Counts (if more experiment were run in the job)
-        # or a single object Counts (if only one experiment was run in the job).
-        # In order to concatenate (i.e. use the + operator) we have to make sure that job.result().get_counts() is a list
-        if isinstance(job.result().get_counts(), list):
-            counts_array = counts_array + job.result().get_counts()
-        else:
-            counts_array = counts_array + [job.result().get_counts()]
-    #print(counts_array)
-    return counts_array
+    # Add the cloning machine circuit block
+    if qcm=='uqcm':
+        qubit_copy1, qubit_copy2 = universal_qcm(circuit, qreg[0], qreg[1], qreg[2])
+    elif qcm=='uqcm_swap':
+        qubit_copy1, qubit_copy2 = universal_qcm_SWAP(circuit, qreg[0], qreg[1], qreg[2])
+    elif qcm=='pcqcm':
+        qubit_copy1, qubit_copy2 = phase_covariant_qcm(circuit, qreg[0], qreg[1], qreg[2])
+    elif qcm=='epcqcm':
+        qubit_copy1, qubit_copy2 = economical_qcm(circuit, qreg[0], qreg[1])
+    else:
+        print("Error: quantum cloning machine not recognized.")
+        exit()
+    index_copy1 = qubit_copy1.index
+    index_copy2 = qubit_copy2.index
 
+    # Add the fidelity measurement
+    if input_states == 'sphere':
+        rotated_measurement(circuit, qreg[index_copy1], creg[index_copy1], theta_param, phi_param)
+        rotated_measurement(circuit, qreg[index_copy2], creg[index_copy2], theta_param, phi_param)
+        circuit_transpiled = transpile(circuit, backend=backend, optimization_level=optimization_level, seed_transpiler=transpiler_seed, initial_layout=initial_layout)
+        circuits_transpiled = [circuit_transpiled.bind_parameters({theta_param: points[0], phi_param: points[1]}) for points in target_points]
+    elif input_states == 'equator' or input_states == 'bb84':
+        rotated_measurement_equator(circuit, qreg[index_copy1], creg[index_copy1], theta_param)
+        rotated_measurement_equator(circuit, qreg[index_copy2], creg[index_copy2], theta_param)
+        circuit_transpiled = transpile(circuit, backend=backend, optimization_level=optimization_level, seed_transpiler=transpiler_seed, initial_layout=initial_layout)
+        circuits_transpiled = [circuit_transpiled.bind_parameters({theta_param: points[0]}) for points in target_points]
+    else:
+        print("Error: input states set not recognized.")
+        exit()
 
-def analyze_data(job_to_analyze, index_copy1, index_copy2, nshots):
-    """
-    Returns an array of marginal probabilities for the experiments run in job_to_analyze
-    """
-    # Get the counts in each job and merge everything into only one array
-    results_probabilities = []
-    counts_array = get_counts_from_jobs([job_to_analyze])
-    # Calculate the marginal probabilities from the counts histograms.
-    for job in counts_array:
-        marg_prob0_copy1, marg_prob0_copy2 = calculate_probabilities(job, index_copy1, index_copy2,
-                                                                     nshots)
-        marg_prob1_copy1 = 1 - marg_prob0_copy1
-        marg_prob1_copy2 = 1 - marg_prob0_copy2
-        results_probabilities.append(
-            [marg_prob0_copy1, marg_prob1_copy1, marg_prob0_copy2, marg_prob1_copy2])
+    # Get the qubit index of the copies in the transpiled circuits
+    # Need to distinguish between simulator and non-simulator, otherwise error
+    if backend.configuration().simulator:
+        index_copy1_transpiled = index_copy1
+        index_copy2_transpiled = index_copy2
+    else:
+        index_copy1_transpiled = circuits_transpiled[0].__dict__['_layout'][qubit_copy1]
+        index_copy2_transpiled = circuits_transpiled[0].__dict__['_layout'][qubit_copy2]
 
-    return results_probabilities
-
-
-
-
+    # Return the coordinates of the points, the circuits and the indices of the transpiled copies
+    return target_points, circuits_transpiled, index_copy1, index_copy2, index_copy1_transpiled, index_copy2_transpiled
